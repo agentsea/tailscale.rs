@@ -197,14 +197,17 @@ impl TailscaleClient {
             url.push_str(&format!("?fields={}", f));
         }
 
+        println!("DELETE request to: {}", url);
         let resp = self.client.delete(url).headers(headers).send().await?;
 
         if resp.status().is_success() {
             // Since the Tailscale docs or actual API might hand us null, parse as Option
             let deleted_device: Option<TailnetDevice> = resp.json().await?;
+            println!("DELETE response: {:?}", deleted_device);
             Ok(deleted_device)
         } else {
             let error_body = resp.text().await?;
+            println!("DELETE error response: {}", error_body);
             Err(anyhow!("Tailscale delete_device error: {}", error_body))
         }
     }
