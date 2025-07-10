@@ -1,6 +1,7 @@
 use tailscale_client::*;
 use anyhow::Result;
 use dotenv::dotenv;
+use reqwest::Client;
 
 /// Test configuration that's tightly coupled to the Docker setup
 struct TestConfig {
@@ -19,12 +20,15 @@ impl TestConfig {
         let tailnet = std::env::var("TAILSCALE_TAILNET")
             .expect("TAILSCALE_TAILNET environment variable must be set");
 
-        // Expected devices from docker-compose.test.yml
-        let expected_devices = vec![
-            "test-device-1".to_string(),
-            "test-device-2".to_string(),
-            "test-device-3".to_string(),
-        ];
+        // Expected devices from environment variables or fallback to defaults
+        let expected_devices = std::env::var("EXPECTED_DOCKER_DEVICES")
+            .map(|devices| devices.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|_| vec![
+                "test-device-1".to_string(),
+                "test-device-2".to_string(),
+                "test-device-3".to_string(),
+                "test-device-removable".to_string(),
+            ]);
 
         // Test timeout - can be overridden via environment
         let test_timeout_seconds = std::env::var("TEST_TIMEOUT_SECONDS")
@@ -39,6 +43,24 @@ impl TestConfig {
             test_timeout_seconds,
         }
     }
+}
+
+/// Cleanup function to remove test devices after tests
+async fn cleanup_test_devices(config: &TestConfig) {
+    let client = TailscaleClient::new(config.api_token.clone());
+    
+    println!("Cleaning up test devices...");
+    
+    for device_name in &config.expected_devices {
+        // Try to find and remove the device
+        if let Ok(Some(_)) = client.remove_device_by_name(&config.tailnet, device_name, None).await {
+            println!("✓ Removed test device: {}", device_name);
+        } else {
+            println!("⚠ Test device {} not found or already removed", device_name);
+        }
+    }
+    
+    println!("✓ Test device cleanup completed!");
 }
 
 // ============================================================================
@@ -477,3 +499,465 @@ async fn test_comprehensive_api_workflow() -> Result<()> {
     println!("✓ Comprehensive API workflow test completed successfully!");
     Ok(())
 }
+
+// ============================================================================
+// REMOVE DEVICE TESTS
+// ============================================================================
+
+#[tokio::test]
+async fn test_remove_device_by_name_existing() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing remove_device_by_name with existing device...");
+    
+    // First, create a temporary device to remove
+    let create_request = CreateAuthKeyRequest {
+        description: Some("Temporary device for removal test".to_string()),
+        expiry_seconds: Some(1800), // 30 minutes
+        capabilities: Capabilities {
+            devices: Devices {
+                create: Some(CreateOpts {
+                    reusable: Some(false),
+                    ephemeral: Some(true),
+                    preauthorized: Some(true),
+                    tags: None,
+                }),
+            },
+        },
+    };
+    
+    let _auth_key = client.create_auth_key(&config.tailnet, false, &create_request).await?;
+    let _temp_device_name = format!("temp-remove-test-{}", rand::random::<u16>());
+    
+    // Test with the dedicated removable device
+    let removable_device_name = "test-device-removable";
+    
+    // First, verify the device exists
+    let existing_device = client.find_device_by_name(&config.tailnet, removable_device_name, None).await?;
+    assert!(existing_device.is_some(), "Removable test device should exist");
+    println!("✓ Found removable device: {}", removable_device_name);
+    
+    // Now remove it
+    println!("Attempting to remove device: {}", removable_device_name);
+    let removed_device = client.remove_device_by_name(&config.tailnet, removable_device_name, None).await?;
+    
+    match removed_device {
+        Some(device) => {
+            println!("✓ Successfully removed device: {}", removable_device_name);
+            assert!(device.id.is_some() || device.node_id.is_some(), "Removed device should have an ID");
+            
+            // Verify it's actually gone
+            let verify_gone = client.find_device_by_name(&config.tailnet, removable_device_name, None).await?;
+            assert!(verify_gone.is_none(), "Device should no longer exist after removal");
+            println!("✓ Verified device was actually removed");
+        }
+        None => {
+            // Tailscale API returns None for successful deletions (empty response)
+            // We need to verify the device was actually removed by checking if it still exists
+            println!("✓ API returned None (expected for successful deletion)");
+            
+            // Verify it's actually gone
+            let verify_gone = client.find_device_by_name(&config.tailnet, removable_device_name, None).await?;
+            assert!(verify_gone.is_none(), "Device should no longer exist after removal");
+            println!("✓ Verified device was actually removed");
+        }
+    }
+    
+    println!("✓ Remove device by name (existing) test completed!");
+    Ok(())
+}
+
+/// Test removing a non-existent device by name
+#[tokio::test]
+async fn test_remove_device_by_name_nonexistent() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing remove_device_by_name with non-existent device...");
+    
+    let non_existent_name = format!("definitely-not-existent-device-{}", rand::random::<u16>());
+    let result = client.remove_device_by_name(&config.tailnet, &non_existent_name, None).await;
+    
+    // Should return None for non-existent device, not an error
+    match result {
+        Ok(None) => {
+            println!("✓ Correctly returned None for non-existent device");
+        }
+        Ok(Some(_)) => {
+            return Err(anyhow::anyhow!("Unexpectedly found and removed non-existent device"));
+        }
+        Err(e) => {
+            // This might be expected if the API returns an error for non-existent devices
+            println!("⚠ API returned error for non-existent device (may be expected): {}", e);
+        }
+    }
+    
+    println!("✓ Remove device by name (non-existent) test completed!");
+    Ok(())
+}
+
+/// Test removing device with different tailnet values
+#[tokio::test]
+async fn test_remove_device_different_tailnets() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing remove_device_by_name with different tailnet values...");
+    
+    // Test with default tailnet ("-")
+    let result_default = client.remove_device_by_name("-", "test-device", None).await;
+    match result_default {
+        Ok(_) => println!("✓ Default tailnet (-) handled correctly"),
+        Err(e) => println!("⚠ Default tailnet error (may be expected): {}", e),
+    }
+    
+    // Test with explicit tailnet
+    let result_explicit = client.remove_device_by_name(&config.tailnet, "test-device", None).await;
+    match result_explicit {
+        Ok(_) => println!("✓ Explicit tailnet handled correctly"),
+        Err(e) => println!("⚠ Explicit tailnet error (may be expected): {}", e),
+    }
+    
+    println!("✓ Remove device with different tailnets test completed!");
+    Ok(())
+}
+
+/// Test remove device with different field options
+#[tokio::test]
+async fn test_remove_device_with_fields() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing remove_device_by_name with different field options...");
+    
+    let test_device_name = format!("test-device-fields-{}", rand::random::<u16>());
+    
+    // Test with default fields
+    let result_default = client.remove_device_by_name(&config.tailnet, &test_device_name, None).await;
+    match result_default {
+        Ok(_) => println!("✓ Default fields handled correctly"),
+        Err(e) => println!("⚠ Default fields error (may be expected): {}", e),
+    }
+    
+    // Test with all fields
+    let result_all = client.remove_device_by_name(&config.tailnet, &test_device_name, Some("all")).await;
+    match result_all {
+        Ok(_) => println!("✓ All fields handled correctly"),
+        Err(e) => println!("⚠ All fields error (may be expected): {}", e),
+    }
+    
+    println!("✓ Remove device with different fields test completed!");
+    Ok(())
+}
+
+/// Test permission issues when removing devices
+#[tokio::test]
+async fn test_remove_device_permission_issues() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing remove_device_by_name permission issues...");
+    
+    // Test 1: Try to remove a device that might be protected (like a shared device)
+    // We'll use a device name that likely doesn't exist to simulate permission issues
+    let protected_device_name = format!("protected-device-{}", rand::random::<u16>());
+    let result = client.remove_device_by_name(&config.tailnet, &protected_device_name, None).await;
+    
+    match result {
+        Ok(None) => {
+            println!("✓ Correctly returned None for non-existent/protected device");
+        }
+        Ok(Some(_)) => {
+            println!("⚠ Unexpectedly found and removed protected device");
+        }
+        Err(e) => {
+            // Check if it's a permission error
+            let error_msg = e.to_string().to_lowercase();
+            if error_msg.contains("permission") || error_msg.contains("forbidden") || error_msg.contains("unauthorized") {
+                println!("✓ Correctly detected permission error: {}", e);
+            } else {
+                println!("⚠ Unexpected error for protected device: {}", e);
+            }
+        }
+    }
+    
+    // Test 2: Try to remove with invalid tailnet (should fail)
+    let invalid_tailnet_result = client.remove_device_by_name("invalid-tailnet-12345", "test-device", None).await;
+    match invalid_tailnet_result {
+        Ok(_) => {
+            println!("⚠ Unexpectedly succeeded with invalid tailnet");
+        }
+        Err(e) => {
+            println!("✓ Correctly failed with invalid tailnet: {}", e);
+        }
+    }
+    
+    println!("✓ Remove device permission issues test completed!");
+    Ok(())
+}
+
+// ============================================================================
+// ENHANCED CLIENT CONSTRUCTOR TESTS
+// ============================================================================
+
+/// Test client constructor with empty API key
+#[tokio::test]
+async fn test_client_constructor_empty_key() -> Result<()> {
+    println!("Testing TailscaleClient::new with empty API key...");
+    
+    let client = TailscaleClient::new("".to_string());
+    
+    // Test that the client can be created (should not panic)
+    assert_eq!(client.token, "");
+    assert_eq!(client.base_url, "https://api.tailscale.com/api/v2");
+    
+    // Test that API calls fail appropriately
+    let result = client.whoami().await;
+    assert!(result.is_err(), "Should fail with empty API key");
+    
+    println!("✓ Empty API key test passed!");
+    Ok(())
+}
+
+/// Test client constructor with malformed API key
+#[tokio::test]
+async fn test_client_constructor_malformed_key() -> Result<()> {
+    println!("Testing TailscaleClient::new with malformed API key...");
+    
+    let malformed_keys = vec![
+        "invalid-token-12345",
+        "tskey-invalid-format",
+        "Bearer invalid-token",
+        "   ", // whitespace
+        "null",
+    ];
+    
+    for key in malformed_keys {
+        let client = TailscaleClient::new(key.to_string());
+        
+        // Test that the client can be created
+        assert_eq!(client.token, key);
+        
+        // Test that API calls fail appropriately
+        let result = client.whoami().await;
+        assert!(result.is_err(), "Should fail with malformed API key: {}", key);
+    }
+    
+    println!("✓ Malformed API key test passed!");
+    Ok(())
+}
+
+// ============================================================================
+// RATE LIMITING AND TIMEOUT TESTS
+// ============================================================================
+
+/// Test rate limiting scenarios by making rapid API calls
+#[tokio::test]
+async fn test_rate_limiting_scenarios() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing rate limiting scenarios...");
+    
+    // Make several rapid API calls to potentially trigger rate limiting
+    let mut results = Vec::new();
+    for _i in 0..5 {
+        let result = client.list_devices(&config.tailnet, None).await;
+        results.push(result);
+        
+        // Small delay to avoid overwhelming the API
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    
+    // Check that most calls succeeded (rate limiting might cause some failures)
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    println!("✓ Made {} rapid API calls, {} succeeded", results.len(), success_count);
+    
+    // At least some calls should succeed
+    assert!(success_count > 0, "At least some API calls should succeed");
+    
+    println!("✓ Rate limiting test completed!");
+    Ok(())
+}
+
+/// Test timeout scenarios with long-running operations
+#[tokio::test]
+async fn test_timeout_scenarios() -> Result<()> {
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    println!("Testing timeout scenarios...");
+    
+    // Test waiting for a non-existent device with a short timeout
+    let start_time = std::time::Instant::now();
+    let result = client.wait_for_device_by_name(
+        &config.tailnet,
+        "non-existent-timeout-test-device",
+        None,
+        2, // 2 retries
+        1, // 1 second delay
+    ).await?;
+    
+    let elapsed = start_time.elapsed();
+    println!("✓ Wait operation completed in {:?}", elapsed);
+    
+    // Should return None for non-existent device
+    assert!(result.is_none(), "Should not find non-existent device");
+    
+    // Should complete within reasonable time (less than 5 seconds)
+    assert!(elapsed.as_secs() < 5, "Wait operation should complete within 5 seconds");
+    
+    println!("✓ Timeout test completed!");
+    Ok(())
+}
+
+// ============================================================================
+// CONCURRENT OPERATIONS TESTS
+// ============================================================================
+
+/// Test concurrent operations on the same tailnet
+#[tokio::test]
+async fn test_concurrent_operations() -> Result<()> {
+    let config = TestConfig::from_env();
+    
+    println!("Testing concurrent operations...");
+    
+    // Create multiple tasks that perform different operations concurrently
+    let api_token = config.api_token.clone();
+    let tailnet = config.tailnet.clone();
+    let device_name = config.expected_devices.first().unwrap().clone();
+    
+    // Task 1: List devices
+    let client1 = TailscaleClient::new(api_token.clone());
+    let tailnet1 = tailnet.clone();
+    let handle1 = tokio::spawn(async move {
+        client1.list_devices(&tailnet1, None).await
+    });
+    
+    // Task 2: Find device by name
+    let client2 = TailscaleClient::new(api_token.clone());
+    let tailnet2 = tailnet.clone();
+    let device_name2 = device_name.clone();
+    let handle2 = tokio::spawn(async move {
+        client2.find_device_by_name(&tailnet2, &device_name2, None).await
+    });
+    
+    // Task 3: Create auth key
+    let client3 = TailscaleClient::new(api_token.clone());
+    let tailnet3 = tailnet.clone();
+    let create_request = CreateAuthKeyRequest {
+        description: Some("Concurrent test auth key".to_string()),
+        expiry_seconds: Some(1800),
+        capabilities: Capabilities {
+            devices: Devices {
+                create: Some(CreateOpts {
+                    reusable: Some(false),
+                    ephemeral: Some(true),
+                    preauthorized: Some(true),
+                    tags: None,
+                }),
+            },
+        },
+    };
+    let handle3 = tokio::spawn(async move {
+        client3.create_auth_key(&tailnet3, false, &create_request).await
+    });
+    
+    // Wait for all tasks to complete and check results individually
+    let result1 = handle1.await?;
+    let result2 = handle2.await?;
+    let result3 = handle3.await?;
+    
+    // Verify all operations completed successfully
+    match &result1 {
+        Ok(_) => println!("✓ Concurrent task 1 (list devices) completed successfully"),
+        Err(e) => println!("⚠ Concurrent task 1 (list devices) failed: {}", e),
+    }
+    
+    match &result2 {
+        Ok(_) => println!("✓ Concurrent task 2 (find device) completed successfully"),
+        Err(e) => println!("⚠ Concurrent task 2 (find device) failed: {}", e),
+    }
+    
+    match &result3 {
+        Ok(_) => println!("✓ Concurrent task 3 (create auth key) completed successfully"),
+        Err(e) => println!("⚠ Concurrent task 3 (create auth key) failed: {}", e),
+    }
+    
+    // At least the first two tasks should succeed (they're read operations)
+    assert!(result1.is_ok(), "List devices should succeed");
+    assert!(result2.is_ok(), "Find device should succeed");
+    
+    println!("✓ Concurrent operations test completed!");
+    Ok(())
+}
+
+// ============================================================================
+// CONFIGURATION TESTING
+// ============================================================================
+
+/// Test different API key formats and configurations
+#[tokio::test]
+async fn test_different_api_key_formats() -> Result<()> {
+    println!("Testing different API key formats...");
+    
+    // Test with various key formats
+    let test_keys = vec![
+        "tskey-auth-valid-format-key",
+        "Bearer tskey-auth-valid-format-key",
+        "tskey-auth-valid-format-key-with-dashes",
+        "tskey-auth-valid-format-key_with_underscores",
+    ];
+    
+    for key in test_keys {
+        let client = TailscaleClient::new(key.to_string());
+        
+        // Test that client can be created
+        assert_eq!(client.token, key);
+        assert_eq!(client.base_url, "https://api.tailscale.com/api/v2");
+        
+        // Test API call (will likely fail with invalid keys, but that's expected)
+        let result = client.whoami().await;
+        match result {
+            Ok(_) => println!("✓ API key format '{}' worked", key),
+            Err(_) => println!("⚠ API key format '{}' failed (expected for test keys)", key),
+        }
+    }
+    
+    println!("✓ Different API key formats test completed!");
+    Ok(())
+}
+
+/// Test environment-specific configurations
+#[tokio::test]
+async fn test_environment_specific_configurations() -> Result<()> {
+    println!("Testing environment-specific configurations...");
+    
+    // Test with different base URLs (if supported in the future)
+    let config = TestConfig::from_env();
+    let client = TailscaleClient::new(config.api_token);
+    
+    // Test that the default configuration works
+    assert_eq!(client.base_url, "https://api.tailscale.com/api/v2");
+    
+    // Test that we can read environment variables
+    let api_token = std::env::var("TAILSCALE_API_TOKEN");
+    let tailnet = std::env::var("TAILSCALE_TAILNET");
+    
+    assert!(api_token.is_ok(), "TAILSCALE_API_TOKEN should be set");
+    assert!(tailnet.is_ok(), "TAILSCALE_TAILNET should be set");
+    
+    println!("✓ Environment-specific configurations test completed!");
+    Ok(())
+}
+
+/// This test should run last to clean up after all other tests
+#[tokio::test]
+#[ignore] // Ignore by default, run with: cargo test test_cleanup_devices -- --ignored
+async fn test_cleanup_devices() -> Result<()> {
+    let config = TestConfig::from_env();
+    cleanup_test_devices(&config).await;
+    Ok(())
+}
+

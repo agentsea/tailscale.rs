@@ -78,7 +78,21 @@ Contributions are welcome! Please open an issue or pull request.
 
 The library includes comprehensive **API contract tests** that verify the client correctly implements the Tailscale API contract using Docker containers as test devices.
 
-#### Quick Start (3 steps)
+#### ⚠️ Important: Use the Test Script
+
+**API contract tests should ONLY be run via the provided script:**
+
+```bash
+./run_tests.sh
+```
+
+**Why this is required:**
+- Tests require a **Docker test environment** with running containers
+- The script handles **environment setup**, **container management**, and **cleanup**
+- Running tests directly with `cargo test` will fail because containers aren't running
+- The script ensures **proper test isolation** and **clean state** between runs
+
+#### Quick Start
 
 1. **Set up environment**:
    Create a `.env` file in the project root and add the following variables:
@@ -95,7 +109,8 @@ The library includes comprehensive **API contract tests** that verify the client
    DEVICE_1=test-device-1
    DEVICE_2=test-device-2
    DEVICE_3=test-device-3
-   EXPECTED_DOCKER_DEVICES=test-device-1,test-device-2,test-device-3
+   DEVICE_REMOVABLE=test-device-removable
+   EXPECTED_DOCKER_DEVICES=test-device-1,test-device-2,test-device-3,test-device-removable
    TEST_TIMEOUT_SECONDS=120
    ```
    
@@ -104,15 +119,17 @@ The library includes comprehensive **API contract tests** that verify the client
    - `TAILSCALE_TAILNET`: Your tailnet name (e.g., `your-org.com` or `-` for default)
    - `TS_AUTH_KEY`: Auth key for Docker containers (starts with `tskey-auth-`) - used by Docker containers to join your tailnet
 
-2. **Start test environment**:
+2. **Run tests**:
    ```bash
-   docker-compose -f docker-compose.test.yml up -d
+   ./run_tests.sh
    ```
 
-3. **Run tests**:
-   ```bash
-   cargo test --test api_contract
-   ```
+   The script will:
+   - ✅ Load environment variables
+   - ✅ Start Docker containers
+   - ✅ Run all API contract tests
+   - ✅ Clean up test devices
+   - ✅ Stop Docker containers
 
 #### Prerequisites
 
@@ -120,6 +137,7 @@ The library includes comprehensive **API contract tests** that verify the client
 - **API token** with device and auth key management permissions
 - **Auth key** for Docker containers (create in Tailscale admin panel)
 - **Docker** and **Docker Compose** installed
+- **Bash shell** (for running the test script)
 
 #### Environment Variables
 
@@ -137,25 +155,28 @@ TS_AUTH_KEY=tskey-auth-xxxxxxxxx
 DEVICE_1=test-device-1
 DEVICE_2=test-device-2
 DEVICE_3=test-device-3
-EXPECTED_DOCKER_DEVICES=test-device-1,test-device-2,test-device-3
+DEVICE_REMOVABLE=test-device-removable
+EXPECTED_DOCKER_DEVICES=test-device-1,test-device-2,test-device-3,test-device-removable
 TEST_TIMEOUT_SECONDS=120
 ```
 
 #### Test Environment
 
 The Docker setup creates:
-- **3 Tailscale test devices** that connect to your tailnet
-- **Isolated test environment** with persistent state
+- **4 Tailscale test devices** that connect to your tailnet (3 persistent + 1 removable)
+- **Isolated test environment** with persistent state stored in `tailscale-state/` directory
 - **Tight coupling** between Docker containers and test expectations
+- **Automatic cleanup** of test devices after each run
 
 #### Test Types
 
 The API contract tests include:
 
 - **Docker Setup Verification**: Ensures all Docker containers are connected and authorized
-- **Device Operations**: Tests device listing, searching, and waiting functionality
+- **Device Operations**: Tests device listing, searching, waiting, and **removal** functionality
 - **Auth Key Management**: Tests creating reusable and non-reusable auth keys
 - **Error Handling**: Tests invalid tokens, tailnets, and edge cases
+- **Rate Limiting & Timeouts**: Tests API behavior under load and timeout conditions
 - **Comprehensive Workflow**: End-to-end test using multiple API calls
 
 #### Customizing the Test Environment
@@ -166,25 +187,45 @@ To add or modify test devices:
    ```bash
    DEVICE_1=my-custom-device-1
    DEVICE_2=my-custom-device-2
-   EXPECTED_DOCKER_DEVICES=my-custom-device-1,my-custom-device-2
+   DEVICE_REMOVABLE=my-custom-removable-device
+   EXPECTED_DOCKER_DEVICES=my-custom-device-1,my-custom-device-2,my-custom-removable-device
    ```
 
 2. **Update `docker-compose.test.yml`** to match the number of devices in your list
 
-3. **Run tests** to verify the new setup
+3. **Run tests** to verify the new setup:
+   ```bash
+   ./run_tests.sh
+   ```
 
-#### Cleanup
+#### Manual Cleanup (if needed)
 
 ```bash
 docker-compose -f docker-compose.test.yml down
 ```
 
-#### Running Specific Tests
+#### Running Individual Tests (Advanced)
 
-```bash
-# Run all API contract tests
-cargo test --test api_contract
-```
+⚠️ **Only for debugging - not recommended for normal testing**
+
+If you need to run individual tests for debugging:
+
+1. **Start the test environment manually**:
+   ```bash
+   docker-compose -f docker-compose.test.yml up -d
+   ```
+
+2. **Run specific tests**:
+   ```bash
+   cargo test test_name -- --nocapture
+   ```
+
+3. **Clean up manually**:
+   ```bash
+   docker-compose -f docker-compose.test.yml down
+   ```
+
+**Note**: The `run_tests.sh` script handles all of this automatically and is the recommended approach.
 
 ## License
 

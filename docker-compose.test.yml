@@ -9,7 +9,7 @@ services:
       - TS_USERSPACE=false
       - TEST_DEVICE_NAME=${DEVICE_1}
     volumes:
-      - ${PWD}/tailscale-nginx/state-test-1:/var/lib/tailscale
+      - ${PWD}/test-env-state/state-test-1:/var/lib/tailscale
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -28,7 +28,7 @@ services:
       - TS_USERSPACE=false
       - TEST_DEVICE_NAME=${DEVICE_2}
     volumes:
-      - ${PWD}/tailscale-nginx/state-test-2:/var/lib/tailscale
+      - ${PWD}/test-env-state/state-test-2:/var/lib/tailscale
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -47,7 +47,7 @@ services:
       - TS_USERSPACE=false
       - TEST_DEVICE_NAME=${DEVICE_3}
     volumes:
-      - ${PWD}/tailscale-nginx/state-test-3:/var/lib/tailscale
+      - ${PWD}/test-env-state/state-test-3:/var/lib/tailscale
     devices:
       - /dev/net/tun:/dev/net/tun
     cap_add:
@@ -56,3 +56,23 @@ services:
     labels:
       - "test.device=true"
       - "test.device.name=${DEVICE_3}"
+
+  tailscale-test-removable:
+    image: tailscale/tailscale:latest
+    hostname: ${DEVICE_REMOVABLE}
+    environment:
+      - TS_AUTHKEY=${TS_AUTH_KEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TEST_DEVICE_NAME=${DEVICE_REMOVABLE}
+    volumes:
+      - ${PWD}/test-env-state/state-test-removable:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+    restart: unless-stopped
+    labels:
+      - "test.device=true"
+      - "test.device.name=${DEVICE_REMOVABLE}"
+      - "test.device.removable=true"
